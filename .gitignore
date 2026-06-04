@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- Virtual Environment ---
+.venv/
+venv/
+env/
+
+# --- uv ---
+# uv.lock is committed for reproducibility
+
+# --- Environment ---
+.env
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Testing ---
+.pytest_cache/
+htmlcov/
+.coverage
+
+# --- MyPy ---
+.mypy_cache/
+
+# --- Uploads ---
+uploads/
