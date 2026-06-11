@@ -94,7 +94,15 @@ class IngestBookService:
             base_metadata = {
                 "user_id": user_id,
                 "library_id": str(library_id),
-                "shelf_id": str(shelf_id) if shelf_id else "",
+                # IMPORTANT: only include shelf_id when it exists.
+                # The retriever uses JSONB containment (@>) for filtering.
+                # Storing "" (empty string) would cause shelf-scoped queries
+                # (filter: {"shelf_id": "UUID_A"}) to MISS these documents,
+                # and library-wide queries (no shelf_id in filter) to correctly
+                # include them. But buku yang di-ingest ke Rak B dengan
+                # shelf_id="UUID_B" harus tidak muncul saat query Rak A.
+                # Solusi: simpan shelf_id HANYA jika ada nilainya.
+                **( {"shelf_id": str(shelf_id)} if shelf_id else {} ),
                 "book_id": str(book_id),
                 "book_title": book_title,
                 "filename": filename,

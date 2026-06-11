@@ -1,24 +1,30 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Bot, Library, Layers, Info } from "lucide-react";
+import { Bot, Library, Layers, Info, AlertCircle } from "lucide-react";
 import { useSearchParams } from "next/navigation";
-import { useCreateChatSession, useChatHistory, useSendMessage } from "@/hooks/useChatSession";
+import {
+  useCreateChatSession,
+  useChatHistory,
+  useStreamMessage,
+} from "@/hooks/useChatSession";
 import { toast } from "sonner";
 import type { Book, ChatMessage, ReferenceItem } from "@/types/api";
 
 import MessageBubble from "@/components/chat/MessageBubble";
+import StreamingBubble from "@/components/chat/StreamingBubble";
 import ChatInput from "@/components/chat/ChatInput";
 
-/** Optimistic message shown in the UI while waiting for AI response */
-interface OptimisticMessage {
+/** Optimistic user message shown instantly before server confirms */
+interface OptimisticUserMessage {
   id: string;
-  role: "user" | "assistant";
+  role: "user";
   content: string;
   from_web: boolean;
   token_count: number;
   created_at: string;
   session_id: string;
+  references: ReferenceItem[];
 }
 
 interface ChatPanelProps {
@@ -28,12 +34,19 @@ interface ChatPanelProps {
   onRefClick?: (ref: ReferenceItem) => void;
 }
 
-export default function ChatPanel({ libraryId: activeLibraryId, sessionId, setSessionId, onRefClick }: ChatPanelProps) {
+export default function ChatPanel({
+  libraryId: activeLibraryId,
+  sessionId,
+  setSessionId,
+  onRefClick,
+}: ChatPanelProps) {
   const searchParams = useSearchParams();
   const activeShelfId = searchParams.get("shelfId");
 
-  // Optimistic messages for instant feedback
-  const [optimisticMessages, setOptimisticMessages] = useState<OptimisticMessage[]>([]);
+  // Optimistic user messages for instant feedback
+  const [optimisticUserMessages, setOptimisticUserMessages] = useState<
+    OptimisticUserMessage[]
+  >([]);
 
   // Chat scope: library-wide (false) or shelf-scoped (true)
   const [shelfScoped, setShelfScoped] = useState(!!activeShelfId);
@@ -47,28 +60,96 @@ export default function ChatPanel({ libraryId: activeLibraryId, sessionId, setSe
 
   const createSession = useCreateChatSession();
   const { data: historyData } = useChatHistory(sessionId);
-  const sendMessage = useSendMessage(sessionId);
+
+  // Streaming state
+  const {
+    send: streamSend,
+    isStreaming,
+    isRetrieving,
+    streamingContent,
+    streamingMeta,
+    streamError,
+  } = useStreamMessage(sessionId);
+
+  // ── Bug fixes ──────────────────────────────────────────────────────────────
+  //
+  // Bug 1: The optimistic user message was cleared whenever historyData
+  //        changed — including the initial empty fetch ({messages:[]}), so
+  //        the user's question disappeared before the AI responded.
+  //        Fix: only clear optimistic messages when history actually contains
+  //        real messages (the server persisted them).
+  //
+  // Bug 2: After streaming finishes (isStreaming→false) the StreamingBubble
+  //        disappears immediately, but the history refetch takes ~200–400 ms.
+  //        During that gap nothing renders, then MessageBubble pops in with
+  //        a different layout (AnswerWithRefs) — causing a visible layout jump.
+  //        Fix: track `pendingStreamContent` — keep the final streamed text
+  //        visible in a static StreamingBubble until the history reload
+  //        actually delivers the new message.
+  //
+  const [pendingStreamContent, setPendingStreamContent] = useState<string>("");
+  const serverMessageCountRef = useRef<number>(0);
+
+  // Detect streaming finished: capture final content → enter "pending sync" phase
+  const prevIsStreamingRef = useRef(false);
+  useEffect(() => {
+    const wasStreaming = prevIsStreamingRef.current;
+    prevIsStreamingRef.current = isStreaming;
+
+    if (wasStreaming && !isStreaming && streamingContent) {
+      // Streaming just ended — preserve the content until history arrives
+      setPendingStreamContent(streamingContent);
+    }
+  }, [isStreaming, streamingContent]);
+
+  // When history loads with new messages: clear optimistic messages AND
+  // the pending stream placeholder (Bug 1 + Bug 2 fix)
+  useEffect(() => {
+    const count = historyData?.messages.length ?? 0;
+    if (count > 0 && count > serverMessageCountRef.current) {
+      serverMessageCountRef.current = count;
+      setOptimisticUserMessages([]);
+      setPendingStreamContent("");
+    }
+  }, [historyData]);
+
+  // ──────────────────────────────────────────────────────────────────────────
 
   // Auto-scroll to bottom
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
 
-  useEffect(scrollToBottom, [historyData, optimisticMessages, scrollToBottom]);
+  useEffect(scrollToBottom, [
+    historyData,
+    optimisticUserMessages,
+    streamingContent,
+    pendingStreamContent,
+    scrollToBottom,
+  ]);
 
-  // When scope changes, switch to a new chat (no session selected)
+  // When scope changes, reset chat
   async function handleScopeChange(toShelf: boolean) {
     if (toShelf && !activeShelfId) return;
     setShelfScoped(toShelf);
     setSessionId(null);
-    setOptimisticMessages([]);
+    setOptimisticUserMessages([]);
+    setPendingStreamContent("");
+    serverMessageCountRef.current = 0;
   }
+
+  // Show stream errors as toasts
+  useEffect(() => {
+    if (streamError) {
+      toast.error("Failed to get AI response: " + streamError);
+    }
+  }, [streamError]);
 
   // Handle send message
   async function handleSend(content: string) {
     if (!content.trim() || !activeLibraryId) return;
 
-    // 1. Ensure we have an active session ID before sending
+    // 1. Ensure session exists
     let targetSessionId = sessionId;
     if (!targetSessionId) {
       try {
@@ -78,15 +159,15 @@ export default function ChatPanel({ libraryId: activeLibraryId, sessionId, setSe
         });
         targetSessionId = session.id;
         setSessionId(session.id);
-      } catch (error) {
+      } catch {
         toast.error("Failed to create new chat session.");
         return;
       }
     }
 
-    // 2. Add optimistic user message to UI
-    const userMsgId = crypto.randomUUID();
-    const userMsg: OptimisticMessage = {
+    // 2. Show optimistic user message immediately
+    const userMsgId = `opt-${crypto.randomUUID()}`;
+    const userMsg: OptimisticUserMessage = {
       id: userMsgId,
       role: "user",
       content,
@@ -94,38 +175,28 @@ export default function ChatPanel({ libraryId: activeLibraryId, sessionId, setSe
       token_count: 0,
       created_at: new Date().toISOString(),
       session_id: targetSessionId,
+      references: [],
     };
-    setOptimisticMessages((prev) => [...prev, userMsg]);
+    setOptimisticUserMessages((prev) => [...prev, userMsg]);
 
-    // 3. Send to API
+    // 3. Start streaming
     try {
-      await sendMessage.mutateAsync({
-        question: content,
-        explicitSessionId: targetSessionId,
-      });
+      await streamSend(content, targetSessionId);
     } catch (err) {
-      console.error("Chat error:", err);
+      console.error("Stream send failed:", err);
       toast.error("Failed to send message");
-      setOptimisticMessages((prev) => prev.filter((m) => m.id !== userMsg.id));
+      setOptimisticUserMessages((prev) =>
+        prev.filter((m) => m.id !== userMsgId)
+      );
     }
   }
 
-  // Combine history + optimistic messages (history from server is ground truth)
   const serverMessages: ChatMessage[] = historyData?.messages ?? [];
-
-  // Clear optimistic messages whenever the server history successfully syncs/updates
-  useEffect(() => {
-    setOptimisticMessages([]);
-  }, [historyData]);
-
-  // Map session_id → references from the last response
-  // (kept for the optimistic assistant placeholder — real refs come from history)
-  const [lastRefs, setLastRefs] = useState<ReferenceItem[]>([]);
-  useEffect(() => {
-    if (sendMessage.data?.data?.references) {
-      setLastRefs(sendMessage.data.data.references);
-    }
-  }, [sendMessage.data]);
+  const isBusy = isStreaming || isRetrieving || createSession.isPending;
+  // Show streaming UI when actively streaming OR while waiting for history sync
+  const showStreamingBubble =
+    isRetrieving || isStreaming || !!pendingStreamContent;
+  const bubbleContent = isStreaming ? streamingContent : pendingStreamContent;
 
 
   return (
@@ -133,13 +204,31 @@ export default function ChatPanel({ libraryId: activeLibraryId, sessionId, setSe
       {/* Chat header */}
       <div className="px-5 py-4 border-b border-border/60 bg-card/50 flex items-center justify-between gap-4">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-full bg-brass/15 border border-brass/30 flex items-center justify-center">
-            <Bot className="w-4 h-4 text-brass" />
+          <div
+            className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${
+              isBusy
+                ? "bg-brass/30 border border-brass/50"
+                : "bg-brass/15 border border-brass/30"
+            }`}
+          >
+            <Bot
+              className={`w-4 h-4 transition-colors ${
+                isBusy ? "text-brass animate-pulse" : "text-brass"
+              }`}
+            />
           </div>
           <div>
-            <div className="text-sm font-semibold text-foreground">AI Librarian</div>
+            <div className="text-sm font-semibold text-foreground">
+              AI Librarian
+            </div>
             <div className="text-[10px] text-muted-foreground">
-              {sessionId ? "Session active" : "Waiting for new chat"}
+              {isRetrieving
+                ? "Searching knowledge base…"
+                : isStreaming
+                ? "Writing response…"
+                : sessionId
+                ? "Session active"
+                : "Waiting for new chat"}
             </div>
           </div>
         </div>
@@ -176,70 +265,62 @@ export default function ChatPanel({ libraryId: activeLibraryId, sessionId, setSe
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto px-5 py-6 space-y-5">
         {/* Empty state */}
-        {serverMessages.length === 0 && optimisticMessages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full gap-4 text-center">
-            <div className="w-16 h-16 rounded-full bg-brass/10 border border-brass/20 flex items-center justify-center">
-              <Bot className="w-8 h-8 text-brass/70" />
+        {serverMessages.length === 0 &&
+          optimisticUserMessages.length === 0 &&
+          !isRetrieving &&
+          !isStreaming &&
+          !pendingStreamContent && (
+            <div className="flex flex-col items-center justify-center h-full gap-4 text-center">
+              <div className="w-16 h-16 rounded-full bg-brass/10 border border-brass/20 flex items-center justify-center">
+                <Bot className="w-8 h-8 text-brass/70" />
+              </div>
+              <div>
+                <p className="font-semibold text-foreground">
+                  {sessionId ? "Ask the Librarian" : "Welcome to Chat"}
+                </p>
+                <p className="text-sm text-muted-foreground mt-1 max-w-60 leading-relaxed">
+                  Feel free to ask a question, a chat session will be created
+                  automatically.
+                </p>
+              </div>
             </div>
-            <div>
-              <p className="font-semibold text-foreground">
-                {sessionId ? "Ask the Librarian" : "Welcome to Chat"}
-              </p>
-              <p className="text-sm text-muted-foreground mt-1 max-w-60 leading-relaxed">
-                Feel free to ask a question, a chat session will be created automatically.
-              </p>
-            </div>
-          </div>
-        )}
+          )}
 
         {/* Render server history */}
         {serverMessages.map((msg) => (
+          <MessageBubble key={msg.id} message={msg} onRefClick={onRefClick} />
+        ))}
+
+        {/* Optimistic user message — shown while waiting for server */}
+        {optimisticUserMessages.map((msg) => (
           <MessageBubble
             key={msg.id}
-            message={msg}
+            message={msg as unknown as ChatMessage}
             onRefClick={onRefClick}
           />
         ))}
 
-        {/* Optimistic messages (shown while waiting for server to sync) */}
-        {optimisticMessages
-          .filter((m) => m.id.startsWith("opt-") || m.role === "user")
-          .slice(-2)
-          .map((msg) => (
-            <MessageBubble
-              key={msg.id}
-              message={msg as unknown as ChatMessage}
-              onRefClick={onRefClick}
-            />
-          ))}
-
-
-        {/* Thinking indicator */}
-        {sendMessage.isPending && (
-          <div className="flex gap-3 items-start">
-            <div className="flex-shrink-0 w-8 h-8 rounded-full bg-brass/20 border border-brass/30 flex items-center justify-center">
-              <Bot className="w-4 h-4 text-brass" />
-            </div>
-            <div className="rounded-2xl rounded-tl-sm bg-card border border-border/50 px-4 py-3 flex items-center gap-2">
-              <span className="w-1.5 h-1.5 bg-brass/60 rounded-full animate-bounce [animation-delay:0ms]" />
-              <span className="w-1.5 h-1.5 bg-brass/60 rounded-full animate-bounce [animation-delay:150ms]" />
-              <span className="w-1.5 h-1.5 bg-brass/60 rounded-full animate-bounce [animation-delay:300ms]" />
-            </div>
-          </div>
+        {/* Live streaming bubble — shown during retrieval, streaming, and
+            while waiting for history to sync after streaming ends */}
+        {showStreamingBubble && (
+          <StreamingBubble
+            content={bubbleContent}
+            isRetrieving={isRetrieving && !streamingContent}
+          />
         )}
 
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Stats bar (when AI responded) */}
-      {sendMessage.data && (
+      {/* Stats bar (shows last stream metadata) */}
+      {streamingMeta && !isBusy && (
         <div className="px-5 py-1.5 bg-muted/30 border-t border-border/40 flex items-center gap-4 text-[10px] text-muted-foreground">
           <span className="flex items-center gap-1">
             <Info className="w-3 h-3" />
-            {sendMessage.data.data.num_docs_retrieved} docs retrieved
+            {streamingMeta.num_docs_retrieved} docs retrieved
           </span>
-          <span>{sendMessage.data.data.num_docs_relevant} relevant</span>
-          {sendMessage.data.data.used_web && (
+          <span>{streamingMeta.num_docs_relevant} relevant</span>
+          {streamingMeta.used_web && (
             <span className="text-yellow-600">+ web search</span>
           )}
         </div>
@@ -247,7 +328,7 @@ export default function ChatPanel({ libraryId: activeLibraryId, sessionId, setSe
 
       <ChatInput
         onSend={handleSend}
-        isLoading={sendMessage.isPending || createSession.isPending}
+        isLoading={isBusy}
         placeholder="Send your first message..."
       />
     </div>

@@ -269,3 +269,8 @@
 .book-appear {
   animation: bookPop 0.35s ease-out forwards;
 }
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}

@@ -188,6 +188,111 @@ class ChatService:
             "references": rag_result.get("references", []),
         }
 
+    async def chat_stream(
+        self,
+        session_id: UUID,
+        user_id: str,
+        question: str,
+    ):
+        """
+        Process a user message with streaming token output.
+
+        Yields SSE-formatted strings:
+            ``data: <json>\\n\\n``
+
+        Each JSON object has the shape:
+            - ``{"type": "token", "content": "<chunk>"}``
+            - ``{"type": "metadata", "session_id": ..., "message_id": ..., ...}``
+            - ``{"type": "error", "message": "<msg>"}``
+            - ``{"type": "done"}``
+        """
+        import json
+
+        # 1. Verify session ownership and get context
+        try:
+            session = await self.get_session(session_id, user_id)
+        except ChatSessionNotFoundError as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            return
+
+        # 2. Build conversation context
+        chat_history = await self._build_chat_history(session_id)
+
+        # 3. Persist user message
+        user_token_count = len(self._encoder.encode(question))
+        user_msg = ChatMessage(
+            session_id=session_id,
+            role="user",
+            content=question,
+            token_count=user_token_count,
+        )
+        await self._chat_repo.add_message(user_msg)
+
+        # 4. Stream from RAG pipeline
+        full_answer = ""
+        metadata: dict = {}
+        had_error = False
+
+        async for event_type, payload in self._rag.run_stream(
+            question=question,
+            user_id=user_id,
+            library_id=session.library_id,
+            shelf_id=session.shelf_id,
+            chat_history=chat_history,
+        ):
+            if event_type == "token":
+                full_answer += payload
+                yield f"data: {json.dumps({'type': 'token', 'content': payload})}\n\n"
+
+            elif event_type == "metadata":
+                metadata = payload
+
+            elif event_type == "error":
+                had_error = True
+                logger.error("[ChatStream] RAG error: %s", payload)
+                yield f"data: {json.dumps({'type': 'error', 'message': payload})}\n\n"
+                break
+
+        if had_error:
+            return
+
+        # 5. Persist assistant response
+        used_web = metadata.get("used_web", False)
+        references = metadata.get("references", [])
+        refs_as_dicts = [
+            ref if isinstance(ref, dict) else ref.__dict__
+            for ref in references
+        ]
+
+        assistant_token_count = len(self._encoder.encode(full_answer))
+        assistant_msg = ChatMessage(
+            session_id=session_id,
+            role="assistant",
+            content=full_answer,
+            from_web=used_web,
+            token_count=assistant_token_count,
+            references=refs_as_dicts,
+        )
+        await self._chat_repo.add_message(assistant_msg)
+
+        # 6. Generate session title if not set
+        if not session.name and full_answer:
+            try:
+                new_title = await self._llm.generate_session_title(question, full_answer)
+                await self._chat_repo.update_session_name(session_id, new_title)
+            except Exception as e:
+                logger.error(f"Failed to generate title for session {session_id}: {e}")
+
+        # 7. Trigger memory compression if needed
+        await self._maybe_summarize(session_id)
+
+        # 8. Emit metadata event with final message info
+        yield f"data: {json.dumps({'type': 'metadata', 'session_id': str(session_id), 'message_id': str(assistant_msg.id), 'used_web': used_web, 'num_docs_retrieved': metadata.get('num_docs_retrieved', 0), 'num_docs_relevant': metadata.get('num_docs_relevant', 0), 'references': references})}\n\n"
+
+        # 9. Signal completion
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
     # ── Memory Management ────────────────────────────────────────────────────
     async def _build_chat_history(self, session_id: UUID) -> list[dict]:
         """

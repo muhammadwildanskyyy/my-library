@@ -99,14 +99,6 @@ class CorrectiveRAGPipeline:
         # Generation chain (LCEL): prompt → LLM → parse string
         self._generation_chain = GENERATION_PROMPT | self._llm | StrOutputParser()
 
-        # Search scope — set before each run
-        self._user_id: str = ""
-        self._library_id: UUID = UUID(int=0)
-        self._shelf_id: UUID | None = None
-
-        # The retrieval pipeline is built per-run because it's scoped
-        self._retriever: Any = None
-
         # Build the LangGraph state machine
         self._graph = self._build_graph()
 
@@ -149,11 +141,19 @@ class CorrectiveRAGPipeline:
         """
         logger.info("[RAG] Retrieving docs for: %s…", state["question"][:80])
 
+        # ── CRITICAL: retriever must be passed in state to avoid race conditions
+        # when multiple concurrent requests share the same pipeline instance.
+        # The retriever is stored in the state dict so each graph invocation
+        # uses its own scoped retriever.
+        retriever = state.get("_retriever")
+        if retriever is None:
+            raise RuntimeError("[RAG] _retriever not set in state — call run() or run_stream()")
+
         # Convert chat history dicts to LangChain message objects
         lc_history = self._to_langchain_messages(state.get("chat_history", []))
 
         # Invoke the history-aware retrieval pipeline
-        raw_docs: list[Document] = await self._retriever.ainvoke(
+        raw_docs: list[Document] = await retriever.ainvoke(
             {"input": state["question"], "chat_history": lc_history}
         )
 
@@ -307,20 +307,21 @@ class CorrectiveRAGPipeline:
             question: The user's query.
             user_id: Current user ID (for pre-filtering).
             library_id: Library scope (for pre-filtering).
-            shelf_id: Optional shelf scope.
+            shelf_id: Optional shelf scope (None = library-wide).
             chat_history: Conversation history as list of {role, content} dicts.
 
         Returns:
             Dict with 'answer', 'used_web', 'references',
             'num_docs_retrieved'.
-        """
-        # Set search scope
-        self._user_id = user_id
-        self._library_id = library_id
-        self._shelf_id = shelf_id
 
-        # Build scoped retrieval pipeline for this request
-        self._retriever = build_full_retrieval_pipeline(
+        Note:
+            The scoped retriever is built **locally** per call and passed
+            through RAGState to avoid race conditions when the pipeline
+            singleton handles concurrent requests.
+        """
+        # Build scoped retrieval pipeline LOCAL to this call — not as instance
+        # variable — to prevent race conditions under concurrent requests.
+        retriever = build_full_retrieval_pipeline(
             llm=self._llm,
             vector_store=self._vector_store,
             session_factory=self._session_factory,
@@ -330,7 +331,12 @@ class CorrectiveRAGPipeline:
             settings=self._settings,
         )
 
-        # Initial state
+        logger.info(
+            "[RAG] run() scope: user=%s library=%s shelf=%s",
+            user_id, library_id, shelf_id,
+        )
+
+        # Initial state — retriever is carried in state to avoid shared mutable state
         initial_state: RAGState = {
             "question": question,
             "chat_history": chat_history or [],
@@ -339,6 +345,7 @@ class CorrectiveRAGPipeline:
             "generation": "",
             "used_web": False,
             "references": [],
+            "_retriever": retriever,  # type: ignore[typeddict-unknown-key]
         }
 
         # Run the graph
@@ -351,3 +358,161 @@ class CorrectiveRAGPipeline:
             "num_docs_retrieved": len(result.get("documents", [])),
             "num_docs_relevant": len(result.get("documents", [])),
         }
+
+    async def run_stream(
+        self,
+        question: str,
+        user_id: str,
+        library_id: UUID,
+        shelf_id: UUID | None = None,
+        chat_history: list[dict] | None = None,
+    ):
+        """
+        Execute the Corrective RAG pipeline with streaming token output.
+
+        Runs the retrieve → decide → (web_search →) nodes synchronously first,
+        then streams the generation token-by-token using astream().
+
+        Note:
+            The scoped retriever is built **locally** per call to prevent
+            race conditions when the singleton handles concurrent requests.
+
+        Yields:
+            Tuple of (event_type: str, payload: str | dict)
+            - ("token", "<chunk_text>")      — each LLM token chunk
+            - ("metadata", {...})             — final metadata after generation
+            - ("error", "<error_message>")    — on failure
+        """
+        # Build retriever LOCAL to this call — prevents shared-state race condition
+        retriever = build_full_retrieval_pipeline(
+            llm=self._llm,
+            vector_store=self._vector_store,
+            session_factory=self._session_factory,
+            user_id=user_id,
+            library_id=library_id,
+            shelf_id=shelf_id,
+            settings=self._settings,
+        )
+
+        logger.info(
+            "[RAG Stream] scope: user=%s library=%s shelf=%s",
+            user_id, library_id, shelf_id,
+        )
+
+        # ── Phase 1: Retrieve ──────────────────────────────────────────────
+        retrieve_state: RAGState = {
+            "question": question,
+            "chat_history": chat_history or [],
+            "documents": [],
+            "web_results": [],
+            "generation": "",
+            "used_web": False,
+            "references": [],
+            "_retriever": retriever,  # type: ignore[typeddict-unknown-key]
+        }
+
+        try:
+            retrieve_result = await self._retrieve_node(retrieve_state)
+        except Exception as e:
+            logger.error("[RAG Stream] Retrieve failed: %s", e)
+            yield ("error", f"Retrieval failed: {e}")
+            return
+
+        retrieve_state.update(retrieve_result)
+
+        # ── Phase 2: Decide source ─────────────────────────────────────────
+        source = self._decide_source(retrieve_state)
+
+        used_web = False
+        if source == "web_search":
+            try:
+                web_result = await self._web_search_node(retrieve_state)
+                retrieve_state.update(web_result)
+                used_web = True
+            except Exception as e:
+                logger.error("[RAG Stream] Web search failed: %s", e)
+                yield ("error", f"Web search failed: {e}")
+                return
+
+        # ── Phase 3: Build generation inputs ──────────────────────────────
+        documents = retrieve_state.get("documents", [])
+        web_parts = retrieve_state.get("web_results", [])
+        references: list[dict] = []
+
+        if documents:
+            context_parts = []
+            for idx, doc in enumerate(documents, start=1):
+                ref_marker = f"[{idx}]"
+                source_info = (
+                    f'(Sumber: "{doc["book_title"]}", '
+                    f'Bagian ke-{doc["chunk_index"] + 1})'
+                )
+                context_parts.append(f"{ref_marker} {source_info}\n{doc['content']}")
+                references.append(
+                    {
+                        "ref_index": idx,
+                        "book_id": doc["book_id"],
+                        "book_title": doc["book_title"],
+                        "filename": doc["filename"],
+                        "chunk_index": doc["chunk_index"],
+                        "source_type": doc["source_type"],
+                    }
+                )
+            context = "\n\n---\n\n".join(context_parts)
+            source_label = "your knowledge base"
+            citation_instruction = (
+                "\n\nIMPORTANT: When using information from the context, "
+                "you MUST cite the source by including the reference number "
+                "in square brackets (e.g., [1], [2]) inline within your answer. "
+                "Place the citation immediately after the relevant sentence or claim. "
+                "Only cite references that you actually use."
+            )
+        elif web_parts:
+            context = "\n\n---\n\n".join(web_parts)
+            source_label = "web search results"
+            citation_instruction = ""
+        else:
+            context = "No relevant information found."
+            source_label = "no available sources"
+            citation_instruction = ""
+
+        lc_history = self._to_langchain_messages(chat_history or [])
+
+        generation_input = {
+            "source_label": source_label,
+            "citation_instruction": citation_instruction,
+            "chat_history": lc_history,
+            "context": context,
+            "question": question,
+        }
+
+        # ── Phase 4: Stream generation ─────────────────────────────────────
+        full_answer = ""
+        try:
+            async for chunk in self._generation_chain.astream(generation_input):
+                if chunk:
+                    full_answer += chunk
+                    yield ("token", chunk)
+        except Exception as e:
+            logger.error("[RAG Stream] Generation streaming failed: %s", e)
+            yield ("error", f"Generation failed: {e}")
+            return
+
+        logger.info(
+            "[RAG Stream] Streamed answer (%d chars, web=%s, references=%d)",
+            len(full_answer),
+            "yes" if used_web else "no",
+            len(references),
+        )
+
+        # ── Phase 5: Yield final metadata ──────────────────────────────────
+        yield (
+            "metadata",
+            {
+                "answer": full_answer,
+                "used_web": used_web,
+                "references": references,
+                "num_docs_retrieved": len(documents),
+                "num_docs_relevant": len(documents),
+            },
+        )

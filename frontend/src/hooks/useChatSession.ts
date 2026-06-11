@@ -5,11 +5,14 @@
  *  POST /api/v1/chat/sessions/                              → create session
  *  GET  /api/v1/chat/sessions/?library_id={id}             → list sessions
  *  POST /api/v1/chat/sessions/{session_id}/messages/        → send message (triggers RAG)
+ *  POST /api/v1/chat/sessions/{session_id}/messages/stream  → stream message (SSE)
  *  GET  /api/v1/chat/sessions/{session_id}/messages/        → message history
  */
 
+import { useCallback, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "@/lib/axios";
+import { streamChatMessage, type StreamMetadata } from "@/lib/chatStream";
 import type {
   ChatHistoryResponse,
   ChatRequest,
@@ -132,3 +135,120 @@ export function useDeleteChatSession() {
     },
   });
 }
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/chat/sessions/{session_id}/messages/stream  (SSE)
+// ---------------------------------------------------------------------------
+export interface StreamingState {
+  /** Text accumulated so far during streaming */
+  streamingContent: string;
+  /** True while tokens are being received */
+  isStreaming: boolean;
+  /** True while the retrieval phase runs (before first token) */
+  isRetrieving: boolean;
+  /** Final metadata received at end of stream */
+  streamingMeta: StreamMetadata | null;
+  /** Error message if streaming failed */
+  streamError: string | null;
+}
+
+/**
+ * Hook for streaming chat responses via SSE.
+ *
+ * Returns `send(question, sessionId)` plus streaming state.
+ * On completion, invalidates the chat history query so the message
+ * is fetched from the server (with full DB-backed data).
+ */
+export function useStreamMessage(sessionId: string | null) {
+  const queryClient = useQueryClient();
+  const abortRef = useRef<AbortController | null>(null);
+
+  const [state, setState] = useState<StreamingState>({
+    streamingContent: "",
+    isStreaming: false,
+    isRetrieving: false,
+    streamingMeta: null,
+    streamError: null,
+  });
+
+  const send = useCallback(
+    async (question: string, explicitSessionId?: string) => {
+      const targetId = explicitSessionId || sessionId;
+      if (!targetId) throw new Error("No active chat session");
+
+      // Cancel any in-flight stream
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      // Reset state — enter retrieval phase
+      setState({
+        streamingContent: "",
+        isStreaming: false,
+        isRetrieving: true,
+        streamingMeta: null,
+        streamError: null,
+      });
+
+      await streamChatMessage({
+        sessionId: targetId,
+        question,
+        signal: controller.signal,
+
+        onToken: (token) => {
+          setState((prev) => ({
+            ...prev,
+            isRetrieving: false,   // first token marks end of retrieval
+            isStreaming: true,
+            streamingContent: prev.streamingContent + token,
+          }));
+        },
+
+        onMetadata: (meta) => {
+          setState((prev) => ({
+            ...prev,
+            streamingMeta: meta,
+          }));
+        },
+
+        onDone: () => {
+          setState((prev) => ({
+            ...prev,
+            isStreaming: false,
+            isRetrieving: false,
+          }));
+          // Refresh history from server
+          queryClient.invalidateQueries({
+            queryKey: chatKeys.history(targetId),
+          });
+          // Refresh sessions list (title may have been generated)
+          queryClient.invalidateQueries({
+            queryKey: ["chat", "sessions"],
+          });
+        },
+
+        onError: (message) => {
+          setState((prev) => ({
+            ...prev,
+            isStreaming: false,
+            isRetrieving: false,
+            streamError: message,
+          }));
+        },
+      });
+    },
+    [sessionId, queryClient]
+  );
+
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+    setState((prev) => ({
+      ...prev,
+      isStreaming: false,
+      isRetrieving: false,
+    }));
+  }, []);
+
+  return { send, cancel, ...state };
+}
+

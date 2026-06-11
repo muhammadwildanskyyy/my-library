@@ -5,6 +5,7 @@ Chat endpoints — sessions, messaging, and history.
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_chat_service, get_current_user_id
 from app.api.v1.schemas.chat import (
@@ -116,6 +117,50 @@ async def send_message(
         references=[
             ReferenceItem(**ref) for ref in result.get("references", [])
         ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stream a message (SSE streaming — Corrective RAG pipeline)
+# ---------------------------------------------------------------------------
+@router.post(
+    "/sessions/{session_id}/messages/stream",
+    summary="Stream a message response — Server-Sent Events (SSE)",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": "SSE stream of tokens and metadata",
+            "content": {"text/event-stream": {}},
+        }
+    },
+)
+async def stream_message(
+    session_id: UUID,
+    body: ChatRequest,
+    user_id: str = Depends(get_current_user_id),
+    chat_svc: ChatService = Depends(get_chat_service),
+) -> StreamingResponse:
+    """
+    Stream the AI Librarian's response as Server-Sent Events.
+
+    Each event is a JSON object sent as ``data: <json>\\n\\n``:
+    - ``{"type": "token", "content": "..."}`` — incremental text tokens
+    - ``{"type": "metadata", "session_id": ..., "message_id": ..., ...}``
+    - ``{"type": "done"}`` — signals completion
+    - ``{"type": "error", "message": "..."}`` — on failure
+    """
+    return StreamingResponse(
+        chat_svc.chat_stream(
+            session_id=session_id,
+            user_id=user_id,
+            question=body.question,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+            "Connection": "keep-alive",
+        },
     )
 
 
