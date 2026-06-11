@@ -1,6 +1,7 @@
 .PHONY: help install dev docker-up docker-down docker-build docker-logs \
        migrate migrate-create migrate-downgrade \
-       lint format typecheck test clean
+       lint format typecheck test clean \
+       frontend-build frontend-logs frontend-dev
 
 # =============================================================================
 # AI Librarian Platform — Makefile
@@ -13,10 +14,10 @@ help: ## Show this help
 # --- Setup -------------------------------------------------------------------
 
 install: ## Install dependencies with uv
-	uv sync
+	cd backend && uv sync
 
 install-dev: ## Install with dev dependencies
-	uv sync --extra dev
+	cd backend && uv sync --extra dev
 
 # --- Docker ------------------------------------------------------------------
 
@@ -38,16 +39,31 @@ docker-logs-app: ## Tail logs from app only
 docker-restart: ## Restart app service (keeps DB)
 	docker compose restart app
 
+docker-logs-frontend: ## Tail logs from frontend only
+	docker compose logs -f frontend
+
+docker-restart-frontend: ## Rebuild and restart frontend only
+	docker compose up -d --build frontend
+
+frontend-dev: ## Run frontend dev server locally (outside Docker)
+	cd frontend && npm run dev
+
+frontend-build: ## Build frontend production bundle locally
+	cd frontend && npm run build
+
+frontend-install: ## Install frontend npm dependencies
+	cd frontend && npm install
+
 # --- Database Migrations -----------------------------------------------------
 
 migrate: ## Run all pending migrations
-	uv run alembic upgrade head
+	cd backend && uv run alembic upgrade head
 
 migrate-create: ## Create a new migration (usage: make migrate-create msg="add users")
-	uv run alembic revision --autogenerate -m "$(msg)"
+	cd backend && uv run alembic revision --autogenerate -m "$(msg)"
 
 migrate-downgrade: ## Downgrade one migration
-	uv run alembic downgrade -1
+	cd backend && uv run alembic downgrade -1
 
 migrate-docker: ## Run migrations inside Docker
 	docker compose exec app alembic upgrade head
@@ -58,21 +74,21 @@ migrate-create-docker: ## Create migration inside Docker (usage: make migrate-cr
 # --- Development -------------------------------------------------------------
 
 dev: ## Run dev server locally (outside Docker)
-	uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+	cd backend && uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 # --- Code Quality ------------------------------------------------------------
 
 lint: ## Lint with ruff
-	uv run ruff check app/ tests/
+	cd backend && uv run ruff check app/ tests/
 
 format: ## Format with ruff
-	uv run ruff format app/ tests/
+	cd backend && uv run ruff format app/ tests/
 
 typecheck: ## Type check with mypy
-	uv run mypy app/
+	cd backend && uv run mypy app/
 
 test: ## Run tests
-	uv run pytest -v
+	cd backend && uv run pytest -v
 
 # --- Cleanup -----------------------------------------------------------------
 

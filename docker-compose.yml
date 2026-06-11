@@ -17,7 +17,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U librarian -d ai_librarian"]
+      test: [ "CMD-SHELL", "pg_isready -U librarian -d ai_librarian" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -25,7 +25,7 @@ services:
   # --- FastAPI App -----------------------------------------------------------
   app:
     build:
-      context: .
+      context: ./backend
       dockerfile: Dockerfile
     container_name: librarian-app
     restart: unless-stopped
@@ -35,16 +35,36 @@ services:
       - "8000:8000"
     volumes:
       # Mount source code for hot-reload in development
-      - ./app:/app/app
-      - ./migrations:/app/migrations
+      - ./backend/app:/app/app
+      - ./backend/migrations:/app/migrations
     depends_on:
       db:
         condition: service_healthy
     command: >
-      uvicorn app.main:app
-      --host 0.0.0.0
-      --port 8000
-      --reload
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # --- Next.js Frontend ------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: librarian-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+      # Disable polling unless you are on Windows/WSL2 and hot-reload fails
+      # WATCHPACK_POLLING: "true" 
+    volumes:
+      - ./frontend:/app
+      # Prevent overwriting node_modules inside container with host's node_modules
+      - /app/node_modules
+      # Prevent overwriting Next.js cache
+      - /app/.next
+    depends_on:
+      - app
 
 volumes:
   pgdata:

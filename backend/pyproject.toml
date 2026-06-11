@@ -1,0 +1,69 @@
+[project]
+name = "ai-librarian"
+version = "0.1.0"
+description = "AI Librarian Platform — Hierarchical RAG with Corrective Search"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # --- Core ---
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "pydantic-settings>=2.7.0",
+    "email-validator>=2.2.0",
+    "python-multipart>=0.0.18",
+    # --- Database & ORM ---
+    "sqlalchemy[asyncio]>=2.0.40",
+    "asyncpg>=0.30.0",
+    "alembic>=1.15.0",
+    "pgvector>=0.3.0,<0.4.0",
+    # --- Auth ---
+    "pyjwt[crypto]>=2.10.0",
+    "bcrypt>=4.3.0",
+    # --- AI & Orchestration ---
+    "langchain>=0.3.0",
+    "langchain-core>=0.3.0",
+    "langgraph>=0.4.0",
+    "langchain-openai>=0.3.0",
+    "langchain-google-genai>=2.1.0",
+    "tavily-python>=0.5.0",
+    # --- LangChain Postgres & Retrieval ---
+    "langchain-postgres>=0.0.12",
+    "langchain-text-splitters>=0.3.0",
+    "langchain-community>=0.3.0",
+    "flashrank>=0.2.0",
+    "psycopg[binary]>=3.1.0",
+    # --- Document Ingestion ---
+    "pymupdf>=1.25.0",
+    "pdfplumber>=0.11.0",
+    "tiktoken>=0.9.0",
+    "cloudinary>=1.44.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "httpx>=0.28.0",
+    "ruff>=0.9.0",
+    "mypy>=1.14.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
